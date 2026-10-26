@@ -1,5 +1,4 @@
-// Package botv2 is the rebuilt Telegram transport. It replaces internal/bot at
-// cutover; until then the old package keeps the process running.
+// Package bot implements the Telegram transport.
 //
 // Two rules are structural here rather than repeated in each screen:
 //   - every button payload is verified by the callback codec before it is
