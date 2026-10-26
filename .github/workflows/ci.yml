@@ -80,8 +80,8 @@ jobs:
 
   ops:
     # The shell scripts, units and config JSON are part of the deployed surface
-    # and had no CI at all: every ops finding in the 2026-10 audit was catchable
-    # here.
+    # and had no CI at all: this job adds a syntax check, shellcheck, a JSON
+    # parse and a tidy module graph.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 10

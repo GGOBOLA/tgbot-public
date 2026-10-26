@@ -1322,10 +1322,9 @@ type errSurfaceCase struct {
 	wantMsg  string
 }
 
-// TestErrorSurface pins the client-facing refusals the audit found untested
-// (M13). Every row drives the real guard(mux) chain, so the semaphore, the
-// routing and the /healthz exemption are part of what is asserted, not just the
-// handler's own error strings.
+// TestErrorSurface pins every client-facing refusal: each row drives the real
+// guard(mux) chain, so the semaphore, the routing and the /healthz exemption
+// are part of what is asserted, not just the handler's own error strings.
 func TestErrorSurface(t *testing.T) {
 	ok200 := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

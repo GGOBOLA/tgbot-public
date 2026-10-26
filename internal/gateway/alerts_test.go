@@ -679,7 +679,7 @@ func TestSpoolStopsAtCap(t *testing.T) {
 // without a second env var to keep in sync.
 func TestSpoolPathFollowsDBPath(t *testing.T) {
 	for _, tc := range []struct{ dbPath, want string }{
-		{"/srv/tgbot/data/bot.db", "/srv/tgbot/data/alerts.spool"},
+		{"/var/lib/tgbot/bot.db", "/var/lib/tgbot/alerts.spool"},
 		{"./data/bot.db", "data/alerts.spool"},
 		{"", ""},
 	} {

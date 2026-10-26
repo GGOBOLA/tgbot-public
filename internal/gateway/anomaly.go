@@ -11,10 +11,10 @@ import (
 	"tgbot/internal/ledger"
 )
 
-// The threat model's last open code item: "a sudden spike in spend or a burst of
-// failed auth is visible in logs but nothing pages anyone". These two watchers
-// are deliberately simple in-memory counters, not a metrics system: they answer
-// "is something happening right now" for an operator who is not reading logs.
+// A sudden spike in spend or a burst of failed auth is visible in logs, but
+// nothing pages anyone, so these two watchers report it. They are deliberately
+// simple in-memory counters, not a metrics system: they answer "is something
+// happening right now" for an operator who is not reading logs.
 
 const (
 	// authFailWindow is how far back a burst is counted.

@@ -41,9 +41,9 @@ else
     *) [ "$AVAIL_KB" -lt 524288 ] && REASON="low disk on $DISK_PATH: ${AVAIL_KB} KB free" ;;
   esac
 
-  # Nothing else watches the snapshots: the backup unit has no OnFailure and the
-  # only age check (verify-timers.sh) is not scheduled anywhere. A daily backup
-  # that stops arriving must reach a human through this path.
+  # Nothing else watches the snapshots: the backup unit has no OnFailure, and
+  # nothing independently checks their age. A daily backup that stops arriving
+  # must reach a human through this path.
   if [ -z "$REASON" ]; then
     BACKUP_DIR="${BACKUP_DIR:-./backups}"
     newest="$(find "$BACKUP_DIR" -maxdepth 1 -name 'bot-*.db' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
