@@ -1,0 +1,7 @@
+[
+  {
+    "model": "riverai/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "prompt_per_million": "1.00",
+    "completion_per_million": "2.00"
+  }
+]

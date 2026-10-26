@@ -1,0 +1,8 @@
+[Unit]
+Description=Notify admins that %i failed
+
+[Service]
+Type=oneshot
+User=tgbot
+WorkingDirectory=/srv/tgbot
+ExecStart=/srv/tgbot/scripts/notify-failure.sh %i

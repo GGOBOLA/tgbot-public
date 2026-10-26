@@ -1,0 +1,127 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # So the weekly scan can be exercised on demand instead of waiting for the
+  # cron: "the job is configured" and "the job has run" are different claims.
+  workflow_dispatch:
+  schedule:
+    # A CVE published against unchanged code is never seen by a push- or
+    # PR-triggered run, so scan the default branch weekly.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+# A superseded push to main should not keep a runner busy next to its
+# replacement.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # The push/PR pipeline; the scheduled run is handled by the `vuln` job.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        # Name the offending files: a bare exit code left the log useless.
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
+      - name: test
+        # -race catches the shared-map and billing concurrency bugs this code
+        # is prone to; it was missing from CI.
+        run: go test -race -count=1 ./...
+      - name: staticcheck
+        # Pinned so a new analyzer release cannot turn main red without a
+        # deliberate bump.
+        run: |
+          # Module tag v0.8.2 is the release named 2026.2.2 — pin the module tag.
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
+          staticcheck ./...
+      - name: gosec
+        # Security scan. Pinned so a new rule release cannot turn main red
+        # without a deliberate bump.
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.30.0
+          gosec -quiet ./...
+      - name: golangci-lint
+        # v1 binaries are built with an older Go and refuse a go1.27 target
+        # ("Go language version used to build golangci-lint is lower than the
+        # targeted Go version"), so install the v2 module from source instead of
+        # using golangci-lint-action, which resolves to a v1 binary.
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
+          golangci-lint run ./...
+      - name: govulncheck
+        # Pinned like the other scanners. The weekly `vuln` job re-runs this
+        # alone so a newly published CVE needs no commit to surface.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          govulncheck ./...
+
+  ops:
+    # The shell scripts, units and config JSON are part of the deployed surface
+    # and had no CI at all: every ops finding in the 2026-10 audit was catchable
+    # here.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: shell syntax
+        run: |
+          for f in scripts/*.sh scripts/lib/*.sh run.sh; do
+            bash -n "$f"
+          done
+      - name: shellcheck
+        # errors only: the tree is clean at this severity, and a new warning
+        # should be a deliberate cleanup, not a blocked merge.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=error scripts/*.sh scripts/lib/*.sh run.sh
+      - name: config json
+        run: python3 -m json.tool config/prices.json > /dev/null
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: modules are tidy
+        run: go mod tidy -diff
+
+  vuln:
+    # Weekly CVE scan, separate from `test` so the push/PR pipeline stays
+    # unaffected and an advisory on unchanged code still gets caught.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          govulncheck ./...

@@ -1,0 +1,12 @@
+[Unit]
+Description=tgbot SQLite snapshot (keeps 14, prunes older)
+After=local-fs.target
+# A failed snapshot used to produce one journal line and no admin alert.
+OnFailure=tgbot-failed@%n.service
+
+[Service]
+Type=oneshot
+User=tgbot
+Group=tgbot
+WorkingDirectory=/srv/tgbot
+ExecStart=/srv/tgbot/scripts/backup.sh

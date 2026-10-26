@@ -1,0 +1,12 @@
+[Unit]
+Description=tgbot daily usage/ledger reconciliation
+After=network-online.target
+Wants=network-online.target
+OnFailure=tgbot-failed@%n.service
+
+[Service]
+Type=oneshot
+User=tgbot
+Group=tgbot
+WorkingDirectory=/srv/tgbot
+ExecStart=/srv/tgbot/scripts/reconcile.sh
