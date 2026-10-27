@@ -31,6 +31,7 @@ var testKey string
 
 // harness wires a gateway to a temp DB and a fake 9router.
 type harness struct {
+	mu      sync.Mutex
 	srv     *Server
 	store   *store.DB
 	dbPath  string // the file the store holds, for raw row assertions
@@ -44,9 +45,12 @@ func newHarness(t *testing.T, upstream http.HandlerFunc) *harness {
 	h := &harness{}
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		h.mu.Lock()
 		h.upMsg = string(body)
 		h.upAuth = r.Header.Get("Authorization")
 		h.upCalls++
+		h.mu.Unlock()
 		upstream(w, r)
 	}))
 	t.Cleanup(fake.Close)
@@ -128,6 +132,169 @@ func TestAuthAndModelGuards(t *testing.T) {
 	}
 	if h.upCalls != 0 {
 		t.Fatal("upstream called with an empty balance")
+	}
+}
+
+func TestModelUnavailableAfterRetriesIsOfflineForEveryCustomer(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"message":"No ready deployment"}}`)
+	})
+	ctx := context.Background()
+	before, err := h.store.Balance(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"test/model","messages":[{"role":"user","content":"hi"}]}`
+	if rec := h.do(t, body, testKey); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("provider unavailable response = %d, want 503: %s", rec.Code, rec.Body)
+	}
+	if h.upCalls != maxUpstreamAttempts {
+		t.Fatalf("upstream attempts = %d, want %d", h.upCalls, maxUpstreamAttempts)
+	}
+	after, err := h.store.Balance(ctx, 42)
+	if err != nil || after != before {
+		t.Fatalf("provider failure changed balance from %d to %d (%v)", before, after, err)
+	}
+	requests, _, _, _, err := h.store.UsageTotals(ctx, 42)
+	if err != nil || requests != 0 {
+		t.Fatalf("provider failure wrote %d usage requests (%v), want none", requests, err)
+	}
+
+	modelsReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	modelsReq.Header.Set("Authorization", "Bearer "+testKey)
+	modelsRec := httptest.NewRecorder()
+	h.srv.handleModels(modelsRec, modelsReq)
+	if modelsRec.Code != http.StatusOK {
+		t.Fatalf("models list status = %d: %s", modelsRec.Code, modelsRec.Body)
+	}
+	var listed struct {
+		Data []modelObject `json:"data"`
+	}
+	if err := json.Unmarshal(modelsRec.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range listed.Data {
+		if model.ID == "test/model" {
+			t.Fatal("offline model is still listed to customers")
+		}
+	}
+
+	if rec := h.do(t, body, testKey); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("call to offline model = %d, want 503: %s", rec.Code, rec.Body)
+	}
+	if h.upCalls != maxUpstreamAttempts {
+		t.Fatalf("offline model reached upstream again: %d calls", h.upCalls)
+	}
+}
+
+func TestOfflineModelReturnsAfterSuccessfulOneTokenProbe(t *testing.T) {
+	var calls atomic.Int32
+	var validProbe atomic.Bool
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		if call >= maxUpstreamAttempts+1 {
+			var probe struct {
+				Model     string `json:"model"`
+				MaxTokens int    `json:"max_tokens"`
+			}
+			if err := json.Unmarshal(body, &probe); err == nil && probe.Model == "test/model" && probe.MaxTokens == 1 {
+				validProbe.Store(true)
+			}
+		}
+		if call <= maxUpstreamAttempts+1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":{"message":"No ready deployment"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"x"}}]}`)
+	})
+	h.srv.availability.backoff = []time.Duration{10 * time.Millisecond}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	maintenanceDone := make(chan struct{})
+	go func() {
+		h.srv.maintenance(ctx)
+		close(maintenanceDone)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-maintenanceDone
+	})
+
+	body := `{"model":"test/model","messages":[{"role":"user","content":"hi"}]}`
+	if rec := h.do(t, body, testKey); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("provider unavailable response = %d, want 503", rec.Code)
+	}
+
+	listed := func() bool {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer "+testKey)
+		rec := httptest.NewRecorder()
+		h.srv.handleModels(rec, req)
+		if rec.Code != http.StatusOK {
+			return false
+		}
+		var payload struct {
+			Data []modelObject `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			return false
+		}
+		for _, model := range payload.Data {
+			if model.ID == "test/model" {
+				return true
+			}
+		}
+		return false
+	}
+	waitUntil(t, listed)
+	if !validProbe.Load() {
+		t.Fatal("availability recovery did not send a one-token request for the offline Model")
+	}
+	if got := calls.Load(); got < maxUpstreamAttempts+2 {
+		t.Fatalf("upstream calls = %d, want failed attempts and two health probes", got)
+	}
+	requests, _, _, _, err := h.store.UsageTotals(context.Background(), 42)
+	if err != nil || requests != 0 {
+		t.Fatalf("provider failure/probes wrote %d usage rows (%v), want none", requests, err)
+	}
+}
+
+func TestMessagesProviderFailureUsesSharedOfflinePolicy(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"message":"No ready deployment"}}`)
+	})
+	ctx := context.Background()
+	before, err := h.store.Balance(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, messagesPath,
+		strings.NewReader(`{"model":"test/model","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Authorization", "Bearer "+testKey)
+	response := httptest.NewRecorder()
+	h.srv.handleMessages(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Messages provider failure = %d, want 503: %s", response.Code, response.Body)
+	}
+	if !strings.Contains(response.Body.String(), "upstream unavailable") {
+		t.Fatalf("Messages provider error shape changed: %s", response.Body)
+	}
+	after, err := h.store.Balance(ctx, 42)
+	if err != nil || after != before {
+		t.Fatalf("Messages provider failure changed balance from %d to %d (%v)", before, after, err)
+	}
+	requests, _, _, _, err := h.store.UsageTotals(ctx, 42)
+	if err != nil || requests != 0 {
+		t.Fatalf("Messages provider failure wrote %d usage rows (%v), want none", requests, err)
+	}
+	if offline, err := h.store.IsModelOffline(ctx, "test/model"); err != nil || !offline {
+		t.Fatalf("Messages provider failure offline state = %v (%v), want true", offline, err)
 	}
 }
 
@@ -912,41 +1079,36 @@ func TestUpstream500NotReplayed(t *testing.T) {
 	}
 }
 
-// TestBillSurvivesCanceledClientContext pins the disconnect fix: a request whose
-// client is already gone must still record usage and take the money.
-func TestBillSurvivesCanceledClientContext(t *testing.T) {
-	// Same rule: the handler runs off the test goroutine, so record the call
-	// instead of calling t.Fatal from it.
+// TestRequestSurvivesCanceledClientContext pins the disconnect fix: a request
+// that loses its client after reaching the upstream still records and charges
+// the delivered usage.
+func TestRequestSurvivesCanceledClientContext(t *testing.T) {
+	client, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var upstreamCalled atomic.Bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalled.Store(true)
-		t.Errorf("upstream must not be called")
+		cancel()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"usage":{"prompt_tokens":1000,"completion_tokens":500}}`)
 	})
-	price, err := h.store.Price(context.Background(), "test/model")
-	if err != nil {
-		t.Fatal(err)
+	req := httptest.NewRequest(http.MethodPost, chatPath,
+		strings.NewReader(`{"model":"test/model","messages":[{"role":"user","content":"hi"}]}`)).WithContext(client)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	rec := httptest.NewRecorder()
+	h.srv.handleChat(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	const prompt, completion = 1000, 500
-	wantCost := ledger.Cost(ledger.Rates{
-		PromptPerMillion:     price.PromptPerMillion,
-		CompletionPerMillion: price.CompletionPerMillion,
-	}, ledger.Usage{Prompt: prompt, Completion: completion})
-
-	client, cancel := context.WithCancel(context.Background())
-	cancel() // the customer hung up before billing
-
-	bctx, done := billingContext(client)
-	defer done()
-	h.srv.bill(bctx, store.Key{ID: 1, TelegramID: 42}, "test/model", price,
-		usage{PromptTokens: prompt, CompletionTokens: completion}, 5, http.StatusOK, true, 0, 0, false)
-	if upstreamCalled.Load() {
-		t.Fatal("billing after a client disconnect must not call the upstream")
+	if !upstreamCalled.Load() {
+		t.Fatal("request did not reach the upstream before the client disconnected")
 	}
 
 	cust, err := h.store.Account(context.Background(), 42)
-	if err != nil || int64(cust.Balance) != 1000*usenPerSen-int64(wantCost) {
+	const wantBalance = 1000*usenPerSen - 500_000
+	if err != nil || int64(cust.Balance) != wantBalance {
 		t.Fatalf("balance %d (%v), want %d: the charge was lost",
-			int64(cust.Balance), err, 1000*usenPerSen-int64(wantCost))
+			int64(cust.Balance), err, wantBalance)
 	}
 }
 

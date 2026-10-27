@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"log"
 	"time"
-
-	"tgbot/internal/ledger"
 )
 
 // Housekeeping intervals and limits.
@@ -19,43 +17,7 @@ const (
 	// piling up. 10 failed requests in an hour is a real outage, not a blip.
 	upstreamAlertThreshold = 10
 	upstreamAlertWindow    = time.Hour
-	// Unbillable call alert: one ping per window. A relay path that breaks
-	// fails every request, and each failure burns real upstream tokens, so the
-	// next alert carries a count instead of a message per call.
-	unbillableAlertWindow = 5 * time.Minute
 )
-
-// alertUnbillable tells the admins about a call we paid for upstream but could
-// not bill, at most once per window. Unlike maybeAlertUpstream this runs on
-// request goroutines, so the throttle state is mutex-guarded; now is a
-// parameter for the same reason as there — tests drive the clock.
-func (s *Server) alertUnbillable(now time.Time, telegramID int64, model string, hold ledger.Amount) {
-	if s.adminAlertSink() == nil {
-		return
-	}
-	s.unbillableMu.Lock()
-	if now.Sub(s.unbillableAlertedAt) < unbillableAlertWindow {
-		// Inside the window the operator hears nothing per call, but the
-		// swallowed ones are remembered: the next alert reports the size of the
-		// loss, not just the one call that happened to open the window.
-		s.unbillableSuppressed++
-		s.unbillableMu.Unlock()
-		return
-	}
-	suppressed := s.unbillableSuppressed
-	s.unbillableSuppressed = 0
-	s.unbillableAlertedAt = now
-	s.unbillableMu.Unlock()
-
-	// s.alert hands the message to the queue, so no request goroutine waits on
-	// Telegram.
-	msg := fmt.Sprintf("⚠️ <b>Unbillable call</b>\n\nCustomer %d, model %s: %d µsen not charged — the response never reached the client.",
-		telegramID, model, int64(hold))
-	if suppressed > 0 {
-		msg += fmt.Sprintf("\n\n…and %d more since the last alert.", suppressed)
-	}
-	s.alert(msg)
-}
 
 // maintenance runs the periodic jobs: idle rate-limit buckets, usage rollup and
 // daily-bucket pruning. It never blocks request handling and stops with ctx.
@@ -65,9 +27,12 @@ func (s *Server) maintenance(ctx context.Context) {
 	// applying. Alerting is skipped on this pass so a restart cannot page an
 	// admin about failures the previous process already reported.
 	s.maintenancePass(ctx, false)
+	s.probeOfflineModels(ctx)
 
 	ticker := time.NewTicker(maintenanceTick)
 	defer ticker.Stop()
+	modelTicker := time.NewTicker(modelAvailabilityTick)
+	defer modelTicker.Stop()
 
 	for {
 		select {
@@ -75,6 +40,10 @@ func (s *Server) maintenance(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.maintenancePass(ctx, true)
+		case <-modelTicker.C:
+			s.probeOfflineModels(ctx)
+		case <-s.availabilityWake:
+			s.probeOfflineModels(ctx)
 		}
 	}
 }

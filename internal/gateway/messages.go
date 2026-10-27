@@ -4,17 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log"
-	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"tgbot/internal/ledger"
-	"tgbot/internal/store"
 )
 
 // messagesPath is the Anthropic-shaped endpoint Claude Code and the Claude SDK use.
@@ -59,6 +55,15 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Unix()
 	out := make([]modelObject, 0, len(prices))
 	for _, p := range prices {
+		offline, err := s.availability.isOffline(r.Context(), p.Model)
+		if err != nil {
+			log.Printf("gateway: check model availability: %v", err)
+			writeErr(w, http.StatusInternalServerError, "model list unavailable")
+			return
+		}
+		if offline {
+			continue
+		}
 		out = append(out, modelObject{
 			ID:      p.Model,
 			Object:  "model",
@@ -81,180 +86,50 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // from events: relayed as SSE for a streaming caller, or rebuilt into one JSON
 // message so a non-streaming client (the Claude SDK) can parse it.
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
-	s.billing.Add(1)
-	defer s.billing.Done()
-
-	start := time.Now()
-	if r.Method != http.MethodPost {
-		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	auth, ok := s.authorize(w, r)
-	if !ok {
-		return
-	}
-
-	// Slot before body: see handleChat.
-	if !s.inflight.acquire(auth.TelegramID) {
-		writeErr(w, http.StatusTooManyRequests, "too many concurrent requests for this account, retry shortly")
-		return
-	}
-	defer s.inflight.release(auth.TelegramID)
-
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "cannot read request body")
-		return
-	}
-	var payload struct {
-		Model     string `json:"model"`
-		Stream    bool   `json:"stream"`
-		MaxTokens int64  `json:"max_tokens"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	if payload.Model == "" {
-		writeErr(w, http.StatusBadRequest, "model is required")
-		return
-	}
-
-	price, hold, ok := s.preflight(w, r, payload.Model, auth, int64(len(body)/4), payload.MaxTokens)
-	if !ok {
-		return
-	}
-
-	// Keep the caller's headers that matter to the Anthropic API.
-	headers := map[string]string{}
-	for _, h := range []string{"anthropic-version", "anthropic-beta"} {
-		if v := r.Header.Get(h); v != "" {
-			headers[h] = v
+	s.serveRequest(w, r, func(body []byte) (requestPlan, *requestFailure) {
+		var payload struct {
+			Model     string `json:"model"`
+			Stream    bool   `json:"stream"`
+			MaxTokens int64  `json:"max_tokens"`
 		}
-	}
-	// Outlive the client so an abandoned stream can still be read to its usage.
-	upCtx, cancelUp := s.upstreamContext(r.Context())
-	defer cancelUp()
-	resp, err := s.forwardWithRetry(upCtx, messagesPath, body, headers)
-	if err != nil {
-		log.Printf("gateway: upstream error: %v", err)
-		writeErr(w, http.StatusBadGateway, "upstream unavailable")
-		return
-	}
-
-	// Keep upstream failures gateway-shaped. The early return preserves the
-	// existing no-usage-row behavior for failed calls.
-	if resp.StatusCode >= 300 {
-		defer func() { _ = resp.Body.Close() }()
-		logUpstreamFailure(resp)
-		writeErr(w, resp.StatusCode, upstreamFailureMessage(resp.StatusCode))
-		return
-	}
-
-	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
-	var (
-		used      usage
-		ttft      int64
-		delivered bool
-	)
-	switch {
-	case isSSE && payload.Stream:
-		used, ttft, delivered = relayClaudeStream(w, resp, start)
-	case isSSE:
-		used, delivered = s.writeClaudeJSON(w, resp)
-	default:
-		used, delivered = readClaudeJSON(w, resp)
-	}
-
-	bctx, cancel := billingContext(r.Context())
-	defer cancel()
-	s.bill(bctx, auth, payload.Model, price, used, ttft, resp.StatusCode, delivered, hold, estimatePromptTokens(body), true)
-}
-
-// authorize authenticates the key and applies the per-customer rate limit,
-// writing the error response itself when either fails.
-func (s *Server) authorize(w http.ResponseWriter, r *http.Request) (store.Key, bool) {
-	// Only rejected keys are throttled, and only per peer address: a proxy puts
-	// every customer on one address, so capping all pre-auth traffic would cap
-	// paying customers together. A refusal here happens before any key is hashed
-	// or any query touches the single SQLite connection.
-	peer := r.RemoteAddr
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		peer = host
-	}
-	now := time.Now()
-	if s.authFails.blocked(peer, now) {
-		w.Header().Set("Retry-After", strconv.Itoa(int(authThrottleWindow.Seconds())))
-		writeErr(w, http.StatusTooManyRequests, "too many failed authentication attempts, retry later")
-		return store.Key{}, false
-	}
-	auth, err := s.authenticate(r)
-	if err != nil {
-		// A missing, malformed or unknown credential is the caller's problem and
-		// stays 401. Anything else came from storage: answering 401 would make
-		// every SDK discard a perfectly good key, and would page the operator
-		// about a leaked key while the database is the actual fault.
-		if errors.Is(err, ErrMissingBearer) || errors.Is(err, ErrMalformedKey) || errors.Is(err, ErrUnauthorized) {
-			s.authFails.fail(peer, now)
-			writeErr(w, http.StatusUnauthorized, "invalid or revoked API key")
-			return store.Key{}, false
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return requestPlan{}, &requestFailure{status: http.StatusBadRequest, message: "invalid JSON body"}
 		}
-		writeErr(w, http.StatusServiceUnavailable, "authentication unavailable")
-		return store.Key{}, false
-	}
-	// Bucket on the customer, not the key: one customer may hold several active
-	// keys (store.MaxActiveKeys) and must not get a fresh budget per key.
-	if ok, wait := s.limiter.Allow(strconv.FormatInt(auth.TelegramID, 10), time.Now()); !ok {
-		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
-		writeErr(w, http.StatusTooManyRequests, "rate limit exceeded, slow down and retry")
-		return store.Key{}, false
-	}
-	return auth, true
-}
-
-// preflight checks that the model is offered and that the customer has credit
-// left. auth is the already-authenticated key: re-reading it here doubled the
-// hash and the database lookup on every request.
-func (s *Server) preflight(w http.ResponseWriter, r *http.Request, model string, auth store.Key, promptTokens, maxTokens int64) (store.ModelPrice, ledger.Amount, bool) {
-	price, err := s.db.Price(r.Context(), model)
-	if errors.Is(err, store.ErrNotFound) {
-		writeErr(w, http.StatusBadRequest, "model not offered: "+model)
-		return store.ModelPrice{}, 0, false
-	}
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "pricing unavailable")
-		return store.ModelPrice{}, 0, false
-	}
-
-	customer, err := s.db.Account(r.Context(), auth.TelegramID)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		writeErr(w, http.StatusInternalServerError, "balance unavailable")
-		return store.ModelPrice{}, 0, false
-	}
-	if customer.Balance <= 0 {
-		writeErr(w, http.StatusPaymentRequired, "insufficient balance, reload it in the Telegram bot")
-		return store.ModelPrice{}, 0, false
-	}
-
-	// Hold enough credit for this call before touching the upstream: the prompt
-	// estimate plus the declared completion (or a default ceiling). Prompt tokens
-	// are held at 1.25x because a cache write costs that much, and under-holding
-	// is how a burst overshoots. This is what bounds the overshoot.
-	if maxTokens <= 0 {
-		maxTokens = defaultMaxTokens
-	}
-	hold := ledger.Cost(price.Rates(), ledger.Usage{
-		Prompt:     promptTokens + promptTokens/4,
-		Completion: maxTokens,
+		if payload.Model == "" {
+			return requestPlan{}, &requestFailure{status: http.StatusBadRequest, message: "model is required"}
+		}
+		headers := make(map[string]string, 2)
+		for _, h := range []string{"anthropic-version", "anthropic-beta"} {
+			if v := r.Header.Get(h); v != "" {
+				headers[h] = v
+			}
+		}
+		return requestPlan{
+			path: messagesPath, model: payload.Model, body: body, headers: headers,
+			preflightPromptTokens: int64(len(body) / 4), maxTokens: payload.MaxTokens,
+			promptEstimate: estimatePromptTokens(body),
+			respond: func(w http.ResponseWriter, resp *http.Response, start time.Time) requestResult {
+				if resp.StatusCode >= 300 {
+					defer func() { _ = resp.Body.Close() }()
+					logUpstreamFailure(resp)
+					writeErr(w, resp.StatusCode, upstreamFailureMessage(resp.StatusCode))
+					return requestResult{}
+				}
+				isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+				var result requestResult
+				switch {
+				case isSSE && payload.Stream:
+					result.usage, result.firstMS, result.delivered = relayClaudeStream(w, resp, start)
+				case isSSE:
+					result.usage, result.delivered = s.writeClaudeJSON(w, resp)
+				default:
+					result.usage, result.delivered = readClaudeJSON(w, resp)
+				}
+				result.upstreamPads = true
+				return result
+			},
+		}, nil
 	})
-	if hold > customer.Balance {
-		writeErr(w, http.StatusPaymentRequired, "insufficient balance for this request, reload it in the Telegram bot")
-		return store.ModelPrice{}, 0, false
-	}
-	// A prepaid balance is the only spend gate. Usage is charged after the call
-	// (store.ChargeUsage), which may take the balance negative by one request;
-	// the next request is refused until the customer tops up.
-	return price, hold, true
 }
 
 // forwardTo replays a request against 9router, adding the given extra headers.

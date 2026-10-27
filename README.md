@@ -11,7 +11,7 @@ v1.0.0, running as `tgbot.service`, CI green.
 
 - **Customers** — view balances and usage, manage keys, view prices, and request top-ups.
 - **Admins** — manage customers, review claims, credit balances, and set prices. The Set prices hub has paginated Priced and Unpriced lists; enter both halves of a model price together.
-- **Gateway** — `POST /v1/chat/completions`, `POST /v1/messages`, `GET /v1/models` (priced models only), and `GET /healthz`.
+- **Gateway** — `POST /v1/chat/completions`, `POST /v1/messages`, `GET /v1/models` (priced, online models), and `GET /healthz`.
 
 ## Quick start
 

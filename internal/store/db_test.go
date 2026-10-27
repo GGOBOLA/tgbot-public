@@ -30,7 +30,7 @@ func TestSchemaV1(t *testing.T) {
 		t.Fatalf("user_version = %d, want %d", version, schemaVersion)
 	}
 
-	for _, table := range []string{"customers", "api_keys", "ledger", "usage", "claims", "prices"} {
+	for _, table := range []string{"customers", "api_keys", "ledger", "usage", "claims", "prices", "model_availability"} {
 		var name string
 		err := d.db.QueryRow(
 			`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)

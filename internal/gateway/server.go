@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"math"
@@ -18,10 +17,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"tgbot/internal/ledger"
 	"tgbot/internal/obs"
 	"tgbot/internal/ratelimit"
 	"tgbot/internal/store"
@@ -52,8 +49,8 @@ const (
 	defaultMaxTokens = 4096
 	chatPath         = "/v1/chat/completions"
 	billingTimeout   = 15 * time.Second
-	// billingDrainTimeout is how long Run waits, after Shutdown, for charges
-	// already inside bill() to finish before the store is closed.
+	// billingDrainTimeout is how long Run waits, after Shutdown, for settlement
+	// already in progress to finish before the store is closed.
 	billingDrainTimeout = 30 * time.Second
 )
 
@@ -129,31 +126,25 @@ type Server struct {
 	authFails *authFailures
 	inflight  *inflightLimiter
 
+	availability     modelAvailability
+	availabilityWake chan struct{}
+
 	// adminAlert, when set, receives provider-disaster pings. Wired from main
 	// with the bot's sender, so the gateway itself never touches Telegram.
-	// alertMu guards it: SetAdminAlert runs at boot, bill() reads it from every
-	// request goroutine, and that ordering is not something to rely on.
+	// alertMu guards it because SetAdminAlert runs at boot and settlement reads
+	// it from request goroutines.
 	alertMu    sync.RWMutex
 	adminAlert func(string)
+	settlement settlement
 	// alerts queues admin alerts off the request path: the wired sink does a
-	// blocking Telegram send, and bill() must not wait for it.
+	// blocking Telegram send, and request settlement must not wait for it.
 	alerts alertQueue
 	// upstreamAlertedAt throttles the disaster alert to one per window. Touched
 	// only from the maintenance goroutine.
 	upstreamAlertedAt time.Time
-	// padWarnedAt unix-seconds of the last "pad looked present but was not
-	// removed" line, so a changed pad size is visible without one log line per
-	// call. Touched from every request goroutine, hence atomic.
-	padWarnedAt atomic.Int64
 	// anomalies turns a burst of rejected auth and a spend spike into an admin
 	// alert instead of a journal line nobody is watching.
 	anomalies *anomalyWatcher
-	// unbillableAlertedAt and unbillableSuppressed throttle the unbillable-call
-	// alert. bill() raises it from every request goroutine, so unbillableMu
-	// guards them — unlike upstreamAlertedAt, which only maintenance touches.
-	unbillableMu         sync.Mutex
-	unbillableAlertedAt  time.Time
-	unbillableSuppressed int
 
 	// billing counts complete chat and Messages handlers. Shutdown's deadline can expire while
 	// a handler is relaying or billing; closing the store under it would lose the
@@ -167,20 +158,30 @@ type Server struct {
 // ratePerSec/burst bound each caller's request rate; the limiter is keyed on the
 // customer's auth.TelegramID, so every key that customer holds shares one budget.
 func New(addr, upstream, apiKey string, db *store.DB, dbPath string, ratePerSec, burst float64) *Server {
-	return &Server{
-		addr:      addr,
-		upstream:  strings.TrimRight(upstream, "/"),
-		apiKey:    apiKey,
-		db:        db,
-		client:    newUpstreamClient(),
-		auth:      Authenticator{Keys: db},
-		limiter:   ratelimit.New(ratePerSec, burst),
-		authFails: newAuthFailures(),
-		anomalies: newAnomalyWatcher(),
-		inflight:  newInflightLimiter(maxInflightPerCustomer),
-		alerts:    newAlertQueue(alertQueueSize, alertSpoolPath(dbPath)),
-		drainCh:   make(chan struct{}),
+	s := &Server{
+		addr:             addr,
+		upstream:         strings.TrimRight(upstream, "/"),
+		apiKey:           apiKey,
+		db:               db,
+		client:           newUpstreamClient(),
+		auth:             Authenticator{Keys: db},
+		limiter:          ratelimit.New(ratePerSec, burst),
+		authFails:        newAuthFailures(),
+		anomalies:        newAnomalyWatcher(),
+		inflight:         newInflightLimiter(maxInflightPerCustomer),
+		availabilityWake: make(chan struct{}, 1),
+		alerts:           newAlertQueue(alertQueueSize, alertSpoolPath(dbPath)),
+		drainCh:          make(chan struct{}),
 	}
+	s.availability = modelAvailability{db: db, probe: s.probeModel, now: time.Now, backoff: modelProbeBackoff[:]}
+	s.settlement = settlement{
+		db:                db,
+		alert:             s.alert,
+		alertSpend:        s.alertSpend,
+		adminAlertPresent: func() bool { return s.adminAlertSink() != nil },
+		now:               time.Now,
+	}
+	return s
 }
 
 // upstreamContext lets a proxied call outlive its client connection while still
@@ -265,7 +266,7 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		stopAlerts()
 		// Shutdown's own deadline force-closes long streams; a handler may still
-		// be inside bill() at that moment, and the store closes as soon as Run
+		// be inside settlement at that moment, and the store closes as soon as Run
 		// returns. Wait for those charges, then report the drain as failed so an
 		// operator sees it rather than a clean exit hiding a lost debit.
 		if !s.waitBilling(billingDrainTimeout) {
@@ -374,240 +375,36 @@ func (w *statusWriter) Flush() {
 	}
 }
 
-// handleChat is the whole request lifecycle: auth → throttle → price → balance →
-// proxy → bill.
+// handleChat adapts OpenAI chat payloads and responses to the shared request
+// lifecycle.
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	s.billing.Add(1)
-	defer s.billing.Done()
-
-	// From the first byte of the request: TTFT includes this gateway's own
-	// processing and any upstream retries, because that is what the customer feels.
-	start := time.Now()
-	if r.Method != http.MethodPost {
-		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-
-	auth, ok := s.authorize(w, r)
-	if !ok {
-		return
-	}
-
-	// Take the per-customer slot before reading the body: with 128 global slots,
-	// admitting bodies first means a burst can hold gigabytes of request bodies.
-	if !s.inflight.acquire(auth.TelegramID) {
-		writeErr(w, http.StatusTooManyRequests, "too many concurrent requests for this account, retry shortly")
-		return
-	}
-	defer s.inflight.release(auth.TelegramID)
-
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "cannot read request body")
-		return
-	}
-	model, stream, maxTokens, outBody, err := prepareBody(body)
-	if err != nil || model == "" {
-		writeErr(w, http.StatusBadRequest, "model is required")
-		return
-	}
-
-	// Four bytes per prompt token is a deliberate over-estimate: JSON overhead
-	// inflates it, and over-estimating only refuses calls that could not be paid
-	// for. It closes the "tiny balance, huge prompt" case max_tokens cannot see.
-	promptEstimate := int64(len(body) / 4)
-
-	price, hold, ok := s.preflight(w, r, model, auth, promptEstimate, maxTokens)
-	if !ok {
-		return
-	}
-
-	// The upstream call must outlive the client: if the customer hangs up, the
-	// relay keeps reading until the usage chunk so the call can still be billed.
-	upCtx, cancelUp := s.upstreamContext(r.Context())
-	defer cancelUp()
-	resp, err := s.forwardWithRetry(upCtx, chatPath, outBody, nil)
-	if err != nil {
-		log.Printf("gateway: upstream error: %v", err)
-		writeErr(w, http.StatusBadGateway, "upstream unavailable")
-		return
-	}
-
-	var (
-		used      usage
-		ttft      int64
-		delivered bool
-	)
-	upstreamPads := stream && strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
-	if upstreamPads {
-		used, ttft, delivered = pipeStream(w, resp, start)
-	} else {
-		used, delivered = writeJSON(w, resp)
-	}
-
-	bctx, cancel := billingContext(r.Context())
-	defer cancel()
-	s.bill(bctx, auth, model, price, used, ttft, resp.StatusCode, delivered, hold, estimatePromptTokens(body), upstreamPads)
+	s.serveRequest(w, r, func(body []byte) (requestPlan, *requestFailure) {
+		model, stream, maxTokens, upstreamBody, err := prepareBody(body)
+		if err != nil || model == "" {
+			return requestPlan{}, &requestFailure{status: http.StatusBadRequest, message: "model is required"}
+		}
+		return requestPlan{
+			path: chatPath, model: model, body: upstreamBody,
+			preflightPromptTokens: int64(len(body) / 4), maxTokens: maxTokens,
+			promptEstimate: estimatePromptTokens(body),
+			respond: func(w http.ResponseWriter, resp *http.Response, start time.Time) requestResult {
+				result := requestResult{}
+				result.upstreamPads = stream && strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+				if result.upstreamPads {
+					result.usage, result.firstMS, result.delivered = pipeStream(w, resp, start)
+				} else {
+					result.usage, result.delivered = writeJSON(w, resp)
+				}
+				return result
+			},
+		}, nil
+	})
 }
 
 // authenticate turns "Bearer sk-…" into an active key. Only a hash leaves this
 // function.
 func (s *Server) authenticate(r *http.Request) (store.Key, error) {
 	return s.auth.Authenticate(r)
-}
-
-// bill records the usage and charges it. A zero-cost call (no tokens reported) is
-// still recorded, so missing usage is visible instead of silently free.
-// delivered is false when the upstream body never reached the client; such a call
-// is not billed at all.
-// promptEstimate is what this request's own body is worth in prompt tokens; it
-// is only used to recognise a proxy pad in the reported count.
-func (s *Server) bill(ctx context.Context, auth store.Key, model string, price store.ModelPrice, u usage, firstMs int64, status int, delivered bool, hold ledger.Amount, promptEstimate int64, upstreamPads bool) {
-	if !delivered {
-		// The upstream answered, but its body could not be relayed (a read error,
-		// a broken stream or the size cap), so the customer was told 502 and
-		// received no tokens. Charging the hold here billed them for a response
-		// they never got, so this call is not billed and gets no usage row: a
-		// failed call is not a served request and must not move the dashboard's
-		// request totals. This matches the status >= 300 branch below.
-		//
-		// The tokens were spent all the same, against our own upstream account,
-		// so this is money lost and the admins are told. The model is
-		// request-derived and stays out of the log line (gosec G706): the alert
-		// carries it instead.
-		// Both values are int64 rendered with %d, so nothing here can carry a
-		// line break: gosec's taint model flags the amount (it derives from the
-		// request size) but log injection needs a string.
-		log.Printf("gateway: response not delivered (customer %d), billing nothing: %d µsen not charged", // #nosec G706 -- %d of an int64 cannot inject a line break
-			auth.TelegramID, int64(hold))
-		s.alertUnbillable(time.Now(), auth.TelegramID, model, hold)
-		return
-	}
-	if u.PromptTokens == 0 && u.CompletionTokens == 0 &&
-		u.CacheReadTokens == 0 && u.CacheCreationTokens == 0 {
-		if status >= 300 {
-			// A failed call is not a served request; counting it would inflate the
-			// dashboard's request totals.
-			return
-		}
-		log.Printf("gateway: no usage reported for %s (customer %d)", model, auth.TelegramID)
-		// A served call that reported nothing is billed at the pre-flight hold.
-		// Charging zero would make missing usage free, and the estimate is the
-		// only number we have. The row is marked estimated, which is what keeps
-		// the gap visible: reconciliation drops marked rows instead of counting
-		// this guess as real drift.
-		if hold > 0 {
-			if _, err := s.db.ChargeUsage(ctx, store.UsageEntry{
-				TelegramID: auth.TelegramID,
-				KeyID:      auth.ID,
-				Model:      model,
-				Cost:       hold,
-				FirstMS:    firstMs,
-				Estimated:  true,
-			}); err != nil {
-				log.Printf("gateway: charge estimated usage for %d: %v", auth.TelegramID, err)
-			}
-			s.alert(fmt.Sprintf("⚠️ <b>Missing usage</b>\n\nCustomer %d, model %s: the upstream reported no tokens. Billed the pre-flight estimate (%d µsen).",
-				auth.TelegramID, model, int64(hold)))
-			return
-		}
-		if err := s.db.RecordUsage(ctx, store.UsageEntry{
-			TelegramID: auth.TelegramID,
-			KeyID:      auth.ID,
-			Model:      model,
-			Cost:       0,
-			FirstMS:    firstMs,
-		}); err != nil {
-			log.Printf("gateway: record usage: %v", err)
-		}
-		return
-	}
-	cacheWrite := u.CacheCreationTokens
-	cache1h := u.CacheCreation1hTokens
-	if cache1h > cacheWrite {
-		cache1h = cacheWrite
-	}
-	// 9router pads the prompt count of every response it converts (see pad.go).
-	// Charging the padded number bills the customer for tokens the model never
-	// received, so the pad is removed before it reaches the price or the ledger.
-	if upstreamPads {
-		billed, padded := billedPromptTokens(u.PromptTokens, promptEstimate)
-		if padded {
-			log.Printf("gateway: proxy pad removed for %s (customer %d): reported %d prompt tokens, billing %d",
-				model, auth.TelegramID, u.PromptTokens, billed)
-			u.PromptTokens = billed
-		} else if u.PromptTokens >= proxyPromptPad && promptEstimate > 0 {
-			// The signature looks padded but the correction refused: the estimate is
-			// too far away, which is what a resized or dropped pad looks like. The
-			// customer would pay the pad silently, so say so once a minute.
-			now := time.Now().Unix()
-			if last := s.padWarnedAt.Load(); now-last >= 60 && s.padWarnedAt.CompareAndSwap(last, now) {
-				log.Printf("gateway: proxy pad not removed (customer %d): reported %d prompt tokens, local estimate %d",
-					auth.TelegramID, u.PromptTokens, promptEstimate)
-			}
-		}
-	}
-	if promptEstimate > 0 {
-		ceiling := saturatingAdd(saturatingMul(promptEstimate, 4), proxyPromptPad)
-		if u.PromptTokens > ceiling {
-			reported := u.PromptTokens
-			u.PromptTokens = ceiling
-			log.Printf("gateway: prompt token count capped (customer %d): reported %d, billing %d", auth.TelegramID, reported, ceiling)
-			s.alert(fmt.Sprintf("⚠️ <b>Prompt token count capped</b>\n\nCustomer %d, model %s: upstream reported %d prompt tokens; billing %d.",
-				auth.TelegramID, model, reported, ceiling))
-		}
-	}
-	// ledger.Cost saturates instead of wrapping negative, so a hostile or
-	// corrupt token count can never credit the customer.
-	cost := ledger.Cost(price.Rates(), ledger.Usage{
-		Prompt:       u.PromptTokens,
-		Completion:   u.CompletionTokens,
-		CacheRead:    u.CacheReadTokens,
-		CacheWrite5m: cacheWrite - cache1h,
-		CacheWrite1h: cache1h,
-	})
-
-	// Each field can arrive from an upstream body, including a negative or an
-	// absurd one. Adding them plainly wrapped to a negative total, the usage
-	// CHECK then rejected the row, and a served call ended up recorded nowhere.
-	promptTotal := saturatingAdd(saturatingAdd(clampTokens(u.PromptTokens), clampTokens(u.CacheReadTokens)), clampTokens(u.CacheCreationTokens))
-	rec := store.UsageEntry{
-		TelegramID: auth.TelegramID,
-		KeyID:      auth.ID,
-		Model:      model,
-		// Cache reads and writes are prompt tokens: store them together so the
-		// dashboard's token count is the real prompt size, while Cost prices
-		// each class separately.
-		PromptTokens:     promptTotal,
-		CompletionTokens: clampTokens(u.CompletionTokens),
-		Cost:             cost,
-		FirstMS:          firstMs,
-	}
-	// Usage and the debit land in one transaction. The pre-flight check compares
-	// against the balance but reserves nothing, so up to maxInflightPerCustomer
-	// calls can all pass it before the first charge lands: exposure is a
-	// multiple of the balance, not the per-call estimate gap. The ledger row
-	// keeps the resulting debt visible.
-	if _, cerr := s.db.ChargeUsage(ctx, rec); cerr != nil {
-		log.Printf("gateway: charge usage for %d: %v", auth.TelegramID, cerr)
-		// The charge context may be the thing that expired. Give the fallback its
-		// own budget, detached from the request, so a served call is still
-		// recorded when the debit could not commit.
-		rctx, rc := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer rc()
-		if rerr := s.db.RecordUsage(rctx, rec); rerr != nil {
-			log.Printf("gateway: record unbooked usage for %d: %v", auth.TelegramID, rerr)
-			s.alert(fmt.Sprintf("🔴 <b>Unbooked usage lost</b>\n\nCustomer %d, model %s, %d µsen: neither the charge nor the usage row could be written.",
-				auth.TelegramID, model, cost))
-		} else {
-			s.alert(fmt.Sprintf("⚠️ <b>Unbooked usage</b>\n\nCustomer %d, model %s, %d µsen could not be charged. It is recorded in usage but not in the ledger.",
-				auth.TelegramID, model, cost))
-		}
-	} else {
-		// Only a committed charge counts toward the hourly spike: the alerts
-		// above are about money that did not move.
-		s.alertSpend(cost)
-	}
 }
 
 // alert hands a message to the admin queue. The request path never waits for
@@ -835,7 +632,7 @@ func pipeStream(w http.ResponseWriter, resp *http.Response, start time.Time) (us
 	// the old code left delivered true and charged the whole hold for silence.
 	// Delivered means bytes reached the client, not that the stream ended
 	// cleanly: a relay cut by the drain still produced output the customer saw,
-	// and bill() must still run for it. An over-long response (one line past
+	// and settlement must still run for it. An over-long response (one line past
 	// maxRelayLine, or the whole body past maxRelayBytes) is the upstream
 	// misbehaving, so it is not charged even though bytes were relayed.
 	return seen, ttft, received > 0 && !errors.Is(err, errRelayTooLong)

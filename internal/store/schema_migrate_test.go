@@ -167,8 +167,8 @@ func TestSchemaV9BoundsPricesAndPreservesAudit(t *testing.T) {
 	if err := d.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 9 {
-		t.Fatalf("user_version = %d, want 9", version)
+	if version != schemaVersion {
+		t.Fatalf("user_version = %d, want %d", version, schemaVersion)
 	}
 	var prompt, completion int64
 	if err := d.db.QueryRowContext(ctx, `SELECT prompt_per_million, completion_per_million FROM prices WHERE model = 'legacy'`).Scan(&prompt, &completion); err != nil {

@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"tgbot/internal/ledger"
 	"tgbot/internal/store"
 )
 
@@ -84,6 +83,38 @@ func TestFailedMessagesNotCounted(t *testing.T) {
 	}
 	if reqs != 0 || spend != 0 {
 		t.Fatalf("failed call counted: requests=%d spend=%d", reqs, spend)
+	}
+}
+
+// A failed Chat response is not billable, even if its stream includes usage.
+func TestFailedChatStreamWithUsageIsNotBilled(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+	before, err := h.store.Balance(t.Context(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"test/model","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	if rec := h.do(t, body, testKey); rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", rec.Code, rec.Body)
+	}
+	after, err := h.store.Balance(t.Context(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("failed provider response changed Customer Balance: %d -> %d", before, after)
+	}
+	requests, _, _, spend, err := h.store.UsageTotals(t.Context(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 || spend != 0 {
+		t.Fatalf("failed provider response recorded usage: requests=%d spend=%d", requests, spend)
 	}
 }
 
@@ -315,31 +346,43 @@ func (a *alertLog) all() []string {
 	return append([]string(nil), a.msgs...)
 }
 
+func interruptedUpstreamResponse(w http.ResponseWriter, _ *http.Request) {
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		return
+	}
+	conn, rw, err := hijacker.Hijack()
+	if err != nil {
+		return
+	}
+	body := `{"usage":{"prompt_tokens":900,"completion_tokens":100}`
+	_, _ = rw.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 512\r\nConnection: close\r\n\r\n" + body)
+	_ = rw.Flush()
+	_ = conn.Close()
+}
+
 // An upstream answer whose body cannot be relayed costs the customer nothing,
 // but those tokens were spent against our 9router account. The operator must be
 // told: before this, a single log line was the only trace of the loss.
 func TestUnbillableCallAlerts(t *testing.T) {
-	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	h := newHarness(t, interruptedUpstreamResponse)
 	log := &alertLog{}
 	h.srv.SetAdminAlert(log.sink)
 
-	price, err := h.store.Price(t.Context(), "test/model")
-	if err != nil {
-		t.Fatal(err)
-	}
 	before, err := h.store.Balance(t.Context(), 42)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const hold = ledger.Amount(250_000) // µsen the call would have cost
-	h.srv.bill(t.Context(), store.Key{ID: 1, TelegramID: 42}, "test/model", price,
-		usage{PromptTokens: 900, CompletionTokens: 100}, 0, http.StatusBadGateway, false, hold, 0, false)
+	body := `{"model":"test/model","messages":[{"role":"user","content":"hi"}]}`
+	if rec := h.do(t, body, testKey); rec.Code != http.StatusBadGateway {
+		t.Fatalf("status %d, want 502: %s", rec.Code, rec.Body)
+	}
 
 	got := log.all()
 	if len(got) != 1 {
 		t.Fatalf("want exactly 1 alert for an unbillable call, got %d: %q", len(got), got)
 	}
-	for _, want := range []string{"Unbillable call", "Customer 42", "test/model", "250000", "never reached the client"} {
+	for _, want := range []string{"Unbillable call", "Customer 42", "test/model", "never reached the client"} {
 		if !strings.Contains(got[0], want) {
 			t.Fatalf("alert does not carry %q: %q", want, got[0])
 		}
@@ -372,39 +415,37 @@ func TestUnbillableCallAlerts(t *testing.T) {
 	}
 }
 
-// A broken relay path fails every request, so the alert is throttled to one per
-// window; the calls it swallowed are carried in the next alert's count.
+// Repeated relay failures do not flood admins with an alert per call.
 func TestUnbillableAlertThrottles(t *testing.T) {
-	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	h := newHarness(t, interruptedUpstreamResponse)
 	log := &alertLog{}
 	h.srv.SetAdminAlert(log.sink)
+	now := time.Now()
+	h.srv.settlement.now = func() time.Time { return now }
 
-	price, err := h.store.Price(t.Context(), "test/model")
-	if err != nil {
-		t.Fatal(err)
+	body := `{"model":"test/model","messages":[{"role":"user","content":"hi"}]}`
+	call := func() {
+		t.Helper()
+		if rec := h.do(t, body, testKey); rec.Code != http.StatusBadGateway {
+			t.Fatalf("status %d, want 502: %s", rec.Code, rec.Body)
+		}
 	}
-	key := store.Key{ID: 1, TelegramID: 42}
-	const hold = ledger.Amount(250_000)
-	billUnbillable := func() {
-		h.srv.bill(t.Context(), key, "test/model", price,
-			usage{PromptTokens: 900, CompletionTokens: 100}, 0, http.StatusBadGateway, false, hold, 0, false)
-	}
-
-	billUnbillable()
+	call()
 	if n := len(log.all()); n != 1 {
 		t.Fatalf("first unbillable call: %d alerts, want 1", n)
 	}
 
 	// Inside the window nothing more may be sent, however many calls fail.
 	for i := 0; i < 3; i++ {
-		billUnbillable()
+		call()
 	}
 	if got := log.all(); len(got) != 1 {
 		t.Fatalf("alert re-fired inside the window: %d alerts: %q", len(got), got)
 	}
 
-	// Past the window one alert fires and names the three it suppressed.
-	h.srv.alertUnbillable(time.Now().Add(unbillableAlertWindow+time.Minute), key.TelegramID, "test/model", hold)
+	// After the window, one alert carries the failures suppressed in it.
+	now = now.Add(unbillableAlertWindow + time.Minute)
+	call()
 	got := log.all()
 	if len(got) != 2 {
 		t.Fatalf("after the window: %d alerts, want 2: %q", len(got), got)
@@ -413,8 +454,7 @@ func TestUnbillableAlertThrottles(t *testing.T) {
 		t.Fatalf("second alert does not carry the suppressed count: %q", got[1])
 	}
 
-	// The new alert opens a fresh window: the suppressed count reset with it.
-	billUnbillable()
+	call()
 	if got := log.all(); len(got) != 2 {
 		t.Fatalf("alert re-fired inside the new window: %d alerts", len(got))
 	}

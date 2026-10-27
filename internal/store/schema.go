@@ -18,8 +18,9 @@ import (
 // deliberately no path from the pre-rebuild schema. Version 7 makes the ledger
 // append-only and prevents deleting a customer with financial history. Version
 // 8 stores the last handled Telegram update id. Version 9 bounds stored prices
-// and price audit values at the same ceiling used by the ledger.
-const schemaVersion = 9
+// and price audit values at the same ceiling used by the ledger. Version 10
+// persists Models taken offline until a successful upstream health check.
+const schemaVersion = 10
 
 // maxMoney mirrors ledger.MaxAmount. It is duplicated as a literal because
 // CHECK constraints cannot reference Go values at runtime.
@@ -144,6 +145,14 @@ var schemaV1 = []string{
 		key   TEXT PRIMARY KEY,
 		value INTEGER NOT NULL
 	)`,
+
+	`CREATE TABLE IF NOT EXISTS model_availability (
+		model          TEXT    PRIMARY KEY,
+		offline_at     INTEGER NOT NULL,
+		next_probe_at  INTEGER NOT NULL,
+		probe_failures INTEGER NOT NULL DEFAULT 0 CHECK (probe_failures >= 0)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_model_availability_probe ON model_availability(next_probe_at)`,
 }
 
 // schemaStep upgrades a database that was already at version `from` to the next
@@ -309,6 +318,18 @@ var schemaSteps = []schemaStep{
 			`DROP TABLE price_changes`,
 			`ALTER TABLE price_changes_v9 RENAME TO price_changes`,
 			`CREATE INDEX IF NOT EXISTS idx_price_changes_model ON price_changes(model, id)`,
+		},
+	},
+	{
+		from: 9,
+		stmts: []string{
+			`CREATE TABLE IF NOT EXISTS model_availability (
+				model          TEXT    PRIMARY KEY,
+				offline_at     INTEGER NOT NULL,
+				next_probe_at  INTEGER NOT NULL,
+				probe_failures INTEGER NOT NULL DEFAULT 0 CHECK (probe_failures >= 0)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_model_availability_probe ON model_availability(next_probe_at)`,
 		},
 	},
 }

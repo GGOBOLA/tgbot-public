@@ -37,7 +37,8 @@ the gateway is published on, ending in `/v1`:
 
 Authorization header: `Authorization: Bearer <your API key>`.
 
-- Available models: same base URL, `/v1/models`.
+- Available models: same base URL, `/v1/models`. Models temporarily offline are
+  omitted; direct calls to them receive `503` until the upstream recovers.
 - Your balance is charged per token at the prices on the 🏷 Price list button.
 - One request can use several small attempts internally; you are only charged
   for tokens actually served.
