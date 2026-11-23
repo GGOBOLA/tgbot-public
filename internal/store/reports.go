@@ -108,19 +108,36 @@ type WindowSummary struct {
 	ActiveCustomers  int64
 }
 
-// SummaryFor aggregates usage since a unix timestamp.
+// SummaryFor aggregates usage since a unix timestamp. One result set keeps
+// request/token/spend fields on the same SQLite snapshot while cost and token
+// totals saturate instead of overflowing SQL SUM.
 func (d *DB) SummaryFor(ctx context.Context, since int64) (WindowSummary, error) {
-	var s WindowSummary
-	err := d.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
-		        COUNT(DISTINCT telegram_id)
-		 FROM usage WHERE created_at >= ?`, since).
-		Scan(&s.Requests, &s.PromptTokens, &s.CompletionTokens, &s.ActiveCustomers)
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT telegram_id, prompt_tokens, completion_tokens, cost
+		 FROM usage WHERE created_at >= ?`, since)
 	if err != nil {
-		return s, err
+		return WindowSummary{}, err
 	}
-	s.Spend, err = d.sumUsageCosts(ctx, costScopeSince, since)
-	return s, err
+	defer func() { _ = rows.Close() }()
+
+	var s WindowSummary
+	owners := make(map[int64]struct{})
+	for rows.Next() {
+		var owner, prompt, completion, cost int64
+		if err := rows.Scan(&owner, &prompt, &completion, &cost); err != nil {
+			return WindowSummary{}, err
+		}
+		s.Requests++
+		s.PromptTokens = addUsageCosts(s.PromptTokens, prompt)
+		s.CompletionTokens = addUsageCosts(s.CompletionTokens, completion)
+		s.Spend = ledger.Amount(addUsageCosts(int64(s.Spend), cost))
+		owners[owner] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return WindowSummary{}, err
+	}
+	s.ActiveCustomers = int64(len(owners))
+	return s, nil
 }
 
 // Spender is one customer's spend in a window.
@@ -177,39 +194,50 @@ type KeyActivity struct {
 	LastUsed         int64
 }
 
-// UsageByKey groups one customer's usage by key since a unix timestamp.
+// UsageByKey groups one customer's usage by key since a unix timestamp. The
+// aggregation is deliberately row-based: SQLite SUM overflows on valid large
+// token/cost values, and separate token/cost queries can use different snapshots.
 func (d *DB) UsageByKey(ctx context.Context, telegramID, since int64) ([]KeyActivity, error) {
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT u.key_id,
-		        COALESCE(k.name, '(deleted key)'),
-		        COUNT(*),
-		        COALESCE(SUM(u.prompt_tokens), 0),
-		        COALESCE(SUM(u.completion_tokens), 0),
-		        COALESCE(SUM(u.cost), 0),
-		        MAX(u.created_at)
+		`SELECT u.key_id, COALESCE(k.name, '(deleted key)'),
+		        u.prompt_tokens, u.completion_tokens, u.cost, u.created_at
 		 FROM usage u LEFT JOIN api_keys k ON k.id = u.key_id
-		 WHERE u.telegram_id = ? AND u.created_at >= ?
-		 GROUP BY u.key_id
-		 ORDER BY 6 DESC`, telegramID, since)
+		 WHERE u.telegram_id = ? AND u.created_at >= ?`, telegramID, since)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 
 	var out []KeyActivity
+	indices := make(map[int64]int)
 	for rows.Next() {
-		var k KeyActivity
-		var keyID sql.NullInt64
-		var spend int64
-		if err := rows.Scan(&keyID, &k.Name, &k.Requests, &k.PromptTokens,
-			&k.CompletionTokens, &spend, &k.LastUsed); err != nil {
+		var keyID sql.Null[int64]
+		var name string
+		var prompt, completion, cost, createdAt int64
+		if err := rows.Scan(&keyID, &name, &prompt, &completion, &cost, &createdAt); err != nil {
 			return nil, err
 		}
-		k.KeyID = keyID.Int64
-		k.Spend = ledger.Amount(spend)
-		out = append(out, k)
+		id := keyID.V
+		i, ok := indices[id]
+		if !ok {
+			i = len(out)
+			indices[id] = i
+			out = append(out, KeyActivity{KeyID: id, Name: name})
+		}
+		k := &out[i]
+		k.Requests++
+		k.PromptTokens = addUsageCosts(k.PromptTokens, prompt)
+		k.CompletionTokens = addUsageCosts(k.CompletionTokens, completion)
+		k.Spend = ledger.Amount(addUsageCosts(int64(k.Spend), cost))
+		if createdAt > k.LastUsed {
+			k.LastUsed = createdAt
+		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Spend > out[j].Spend })
+	return out, nil
 }
 
 // RenameKey renames one key the customer owns.

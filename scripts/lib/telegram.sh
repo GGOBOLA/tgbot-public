@@ -15,6 +15,8 @@ send_admins() {
   TEXT="$1" python3 - <<'PY'
 import os, sys, urllib.parse, urllib.request
 tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+base = os.environ.get("TELEGRAM_API_URL", "https://api.telegram.org").rstrip("/")
+
 admins = [a.strip() for a in os.environ.get("ADMIN_IDS", "").split(",") if a.strip()]
 text = os.environ["TEXT"]
 if not tok or not admins:
@@ -25,7 +27,7 @@ for a in admins:
     data = urllib.parse.urlencode(
         {"chat_id": a, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}
     ).encode()
-    req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage", data=data)
+    req = urllib.request.Request(f"{base}/bot{tok}/sendMessage", data=data)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             r.read()

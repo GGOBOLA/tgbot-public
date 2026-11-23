@@ -59,7 +59,7 @@ func (s *Server) forwardWithRetry(ctx context.Context, path string, body []byte,
 		if failures == 0 {
 			return
 		}
-		recovered := ferr == nil && final != nil && final.StatusCode < 500
+		recovered := ferr == nil && final != nil && final.StatusCode >= 200 && final.StatusCode < 300
 		// The request context may already be cancelled; the record still matters.
 		// WithoutCancel strips the deadline, so give the write a budget of its own:
 		// otherwise a blocked SQLite write holds the handler and its slot forever.

@@ -34,20 +34,31 @@ func (d *DB) Account(ctx context.Context, telegramID int64) (Account, error) {
 
 // UsageWindow sums one customer's usage since a unix timestamp. The dashboard
 // uses it for "last 7 days" without a rollup table: the usage index on
-// (telegram_id, created_at) answers it directly.
+// (telegram_id, created_at) answers it directly. Keep all aggregates in one
+// result set so a concurrent charge cannot produce a mixed snapshot.
 func (d *DB) UsageWindow(ctx context.Context, telegramID, since int64) (requests, prompt, completion int64, spend ledger.Amount, err error) {
-	err = d.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0)
-		 FROM usage WHERE telegram_id = ? AND created_at >= ?`, telegramID, since).
-		Scan(&requests, &prompt, &completion)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, 0, 0, 0, nil
-	}
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT prompt_tokens, completion_tokens, cost
+		 FROM usage WHERE telegram_id = ? AND created_at >= ?`, telegramID, since)
 	if err != nil {
-		return requests, prompt, completion, 0, err
+		return 0, 0, 0, 0, err
 	}
-	spend, err = d.sumUsageCosts(ctx, costScopeOwnerSince, telegramID, since)
-	return requests, prompt, completion, spend, err
+	defer func() { _ = rows.Close() }()
+	var totalCost int64
+	for rows.Next() {
+		var p, c, cost int64
+		if err := rows.Scan(&p, &c, &cost); err != nil {
+			return 0, 0, 0, 0, err
+		}
+		requests++
+		prompt = addUsageCosts(prompt, p)
+		completion = addUsageCosts(completion, c)
+		totalCost = addUsageCosts(totalCost, cost)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	return requests, prompt, completion, ledger.Amount(totalCost), nil
 }
 
 // pruneBatch is how many rows one DELETE may remove. The store runs on a single

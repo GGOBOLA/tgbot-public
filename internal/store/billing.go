@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"tgbot/internal/ledger"
 )
@@ -34,11 +35,16 @@ func (d *DB) ChargeUsage(ctx context.Context, rec UsageEntry) (ledger.Amount, er
 	if rec.KeyID != 0 {
 		keyID = rec.KeyID
 	}
-	if _, err := tx.ExecContext(ctx,
+	result, err := tx.ExecContext(ctx,
 		`INSERT INTO usage (telegram_id, key_id, model, prompt_tokens, completion_tokens, cost, created_at, first_ms, estimated)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.TelegramID, keyID, rec.Model, rec.PromptTokens, rec.CompletionTokens,
-		int64(rec.Cost), nowUnix(), rec.FirstMS, boolInt(rec.Estimated)); err != nil {
+		int64(rec.Cost), nowUnix(), rec.FirstMS, boolInt(rec.Estimated))
+	if err != nil {
+		return 0, err
+	}
+	usageID, err := result.LastInsertId()
+	if err != nil {
 		return 0, err
 	}
 
@@ -48,7 +54,7 @@ func (d *DB) ChargeUsage(ctx context.Context, rec UsageEntry) (ledger.Amount, er
 		// A free or failed call still records the row; it just moves no money.
 		balance, err = balanceInTx(ctx, tx, rec.TelegramID)
 	} else {
-		balance, crossed, err = applyTx(ctx, tx, rec.TelegramID, -rec.Cost, "usage", "")
+		balance, crossed, err = applyTx(ctx, tx, rec.TelegramID, -rec.Cost, "usage", fmt.Sprintf("usage:%d", usageID))
 	}
 	if err != nil {
 		return 0, err

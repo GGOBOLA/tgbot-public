@@ -367,6 +367,11 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
+// Unwrap gives http.ResponseController access to the underlying connection's
+// write deadline. Without it, SetWriteDeadline fails on every guarded stream
+// and a non-reading client can hold a slot for the full request deadline.
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // Flush keeps SSE working through the wrapper: the relay type-asserts for
 // http.Flusher, and a wrapper that hides it would buffer every stream.
 func (w *statusWriter) Flush() {
@@ -473,6 +478,9 @@ func prepareBody(body []byte) (model string, stream bool, maxTokens int64, out [
 	dec.UseNumber()
 	if err := dec.Decode(&m); err != nil {
 		return "", false, 0, nil, err
+	}
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return "", false, 0, nil, errors.New("request body must contain exactly one JSON object")
 	}
 	model, _ = m["model"].(string)
 	stream, _ = m["stream"].(bool)

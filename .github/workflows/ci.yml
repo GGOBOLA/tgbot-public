@@ -101,6 +101,9 @@ jobs:
           shellcheck --severity=error scripts/*.sh scripts/lib/*.sh run.sh
       - name: config json
         run: python3 -m json.tool config/prices.json > /dev/null
+      - name: reconciliation regressions
+        # Uses an isolated book and a fake Telegram API, not the live service.
+        run: python3 scripts/reconcile_test.py
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod

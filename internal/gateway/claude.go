@@ -3,6 +3,7 @@ package gateway
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -368,7 +369,9 @@ func (s *Server) writeClaudeJSON(w http.ResponseWriter, resp *http.Response) (us
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(a.render())
+	if _, err := w.Write(a.render()); err != nil {
+		return usage{}, false
+	}
 	return a.usage.toUsage(), true
 }
 
@@ -387,7 +390,7 @@ func relayClaudeStream(w http.ResponseWriter, resp *http.Response, start time.Ti
 	if err != nil {
 		log.Printf("gateway: claude stream copy: %v", err)
 	}
-	return seen.toUsage(), ttft, received > 0
+	return seen.toUsage(), ttft, received > 0 && !errors.Is(err, errRelayTooLong)
 }
 
 // claudeUsageFromLine pulls usage out of one SSE "data:" line, if it carries any.

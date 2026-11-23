@@ -28,7 +28,7 @@ Payments need `PAYMENT_QR_PATH` set to the DuitNow image path.
 
 ## Configuration
 
-Go 1.27.3. SQLite is embedded via `modernc.org/sqlite`; no database server or CGO is needed.
+Go 1.27.4 (includes the HTTP/1 request-body race fix). SQLite is embedded via `modernc.org/sqlite`; no database server or CGO is needed.
 Config fails fast at boot.
 
 | Variable | Required | Meaning |

@@ -2,9 +2,7 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"fmt"
 	"math"
 
 	"tgbot/internal/ledger"
@@ -56,65 +54,34 @@ func (d *DB) RecordUsage(ctx context.Context, rec UsageEntry) error {
 }
 
 // UsageTotals returns lifetime requests, tokens and spend for one customer.
+// All fields come from one result set: separate SQL SUM queries can overflow
+// int64 and can observe different snapshots while a charge is committing.
 func (d *DB) UsageTotals(ctx context.Context, telegramID int64) (requests, prompt, completion int64, spend ledger.Amount, err error) {
-	err = d.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0)
-		 FROM usage WHERE telegram_id = ?`, telegramID).
-		Scan(&requests, &prompt, &completion)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, 0, 0, 0, nil
-	}
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT prompt_tokens, completion_tokens, cost FROM usage WHERE telegram_id = ?`, telegramID)
 	if err != nil {
-		return requests, prompt, completion, 0, err
-	}
-	spend, err = d.sumUsageCosts(ctx, costScopeOwner, telegramID)
-	return requests, prompt, completion, spend, err
-}
-
-// usageCostScope names one of the fixed predicates below. It is an enum, not a
-// string, so no caller can hand this function SQL: the query text only ever
-// comes from the constants in this file.
-type usageCostScope int
-
-const (
-	// costScopeOwner: every cost row for one customer.
-	costScopeOwner usageCostScope = iota
-	// costScopeOwnerSince: one customer's costs at or after a timestamp.
-	costScopeOwnerSince
-	// costScopeSince: every cost row at or after a timestamp.
-	costScopeSince
-)
-
-// sumUsageCosts accumulates individual costs so SQLite never has to represent
-// an overflowing SUM as REAL. Totals outside ledger.Amount's range saturate.
-func (d *DB) sumUsageCosts(ctx context.Context, scope usageCostScope, args ...any) (ledger.Amount, error) {
-	var query string
-	switch scope {
-	case costScopeOwner:
-		query = `SELECT cost FROM usage WHERE telegram_id = ?`
-	case costScopeOwnerSince:
-		query = `SELECT cost FROM usage WHERE telegram_id = ? AND created_at >= ?`
-	case costScopeSince:
-		query = `SELECT cost FROM usage WHERE created_at >= ?`
-	default:
-		return 0, fmt.Errorf("unknown usage cost scope %d", scope)
-	}
-	rows, err := d.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return 0, err
+		return 0, 0, 0, 0, err
 	}
 	defer func() { _ = rows.Close() }()
-	var total int64
+	var totalCost int64
 	for rows.Next() {
-		var cost int64
-		if err := rows.Scan(&cost); err != nil {
-			return 0, err
+		var p, c, cost int64
+		if err := rows.Scan(&p, &c, &cost); err != nil {
+			return 0, 0, 0, 0, err
 		}
-		total = addUsageCosts(total, cost)
+		requests++
+		prompt = addUsageCosts(prompt, p)
+		completion = addUsageCosts(completion, c)
+		totalCost = addUsageCosts(totalCost, cost)
 	}
-	return ledger.Amount(total), rows.Err()
+	if err := rows.Err(); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	return requests, prompt, completion, ledger.Amount(totalCost), nil
 }
 
+// addUsageCosts accumulates nonnegative token and money values without allowing
+// SQLite's SUM to turn an int64 overflow into a failed dashboard query.
 func addUsageCosts(total, cost int64) int64 {
 	if cost > 0 && total > math.MaxInt64-cost {
 		return math.MaxInt64

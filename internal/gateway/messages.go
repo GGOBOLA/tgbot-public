@@ -180,7 +180,9 @@ func readClaudeJSON(w http.ResponseWriter, resp *http.Response) (usage, bool) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(body)
+	if _, err := w.Write(body); err != nil {
+		return usage{}, false
+	}
 
 	// Only 2xx bodies reach here: handleMessages relayed and returned already
 	// for any status >= 300.

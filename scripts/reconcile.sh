@@ -52,24 +52,46 @@ usage = c.execute(
     + (" and estimated = 0" if marked else ""),
     (since,),
 ).fetchone()[0]
-# An estimated charge wrote a usage row and its ledger row in the same
-# transaction, but nothing links the two rows. The only way to drop the ledger
-# side of an estimate is to match the charge it produced: same customer, same
-# second, same amount. A mismatch can only over-report drift (both rows of a
-# real charge would have to collide with an estimate), never hide it.
-ledger_sql = (
-    "select coalesce(sum(-l.delta), 0) from ledger l "
-    "where l.reason = 'usage' and l.created_at >= ?"
-)
-if marked:
-    ledger_sql += (
-        " and not exists (select 1 from usage u"
-        " where u.estimated = 1"
-        " and u.telegram_id = l.telegram_id"
-        " and u.cost = -l.delta"
-        " and u.created_at = l.created_at)"
-    )
-ledger = c.execute(ledger_sql, (since,)).fetchone()[0]
+# An estimated charge wrote its usage and ledger rows in the same transaction.
+# Current rows carry an explicit usage:<id> reference. Legacy rows have no
+# such reference, so the fallback below excludes no more ledger rows than
+# matching estimates; an excess charge can no longer disappear behind a
+# colliding estimate.
+# New charges link the ledger row to usage.id through the usage:<id> ref.
+# A direct join is reliable even when two calls have the same customer, amount
+# and timestamp. The legacy fallback below has to guess by those fields, but
+# must exclude at most one ledger row per estimate: every additional excess
+# row remains visible as drift.
+ledger = c.execute(
+    """select coalesce(sum(-l.delta), 0) from ledger l
+       where l.reason = 'usage' and l.created_at >= ?
+         and l.ref <> ''
+         and not exists (
+           select 1 from usage u
+            where u.estimated = 1 and l.ref = 'usage:' || u.id
+         )""",
+    (since,),
+).fetchone()[0]
+legacy = c.execute(
+    """with eligible as (
+         select l.id, l.delta,
+                row_number() over (
+                  partition by l.telegram_id, l.delta, l.created_at
+                  order by l.id
+                ) as charge_number,
+                (select count(*) from usage u
+                  where u.estimated = 1
+                    and u.telegram_id = l.telegram_id
+                    and u.cost = -l.delta
+                    and u.created_at = l.created_at) as estimate_count
+           from ledger l
+          where l.reason = 'usage' and l.created_at >= ? and l.ref = ''
+       )
+       select coalesce(sum(-delta), 0) from eligible
+        where charge_number > estimate_count""",
+    (since,),
+).fetchone()[0]
+ledger += legacy
 bad = c.execute(
     """select count(*) from (
          select cu.telegram_id,

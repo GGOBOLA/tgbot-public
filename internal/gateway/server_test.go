@@ -438,7 +438,7 @@ func TestStreamWriteStallBillsDeliveredUsageAndReleasesInflight(t *testing.T) {
 	request.Header.Set("Authorization", "Bearer "+testKey)
 	done := make(chan struct{})
 	go func() {
-		h.srv.handleChat(writer, request)
+		h.srv.guard(http.HandlerFunc(h.srv.handleChat)).ServeHTTP(writer, request)
 		close(done)
 	}()
 	select {
