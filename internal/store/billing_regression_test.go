@@ -27,7 +27,11 @@ func TestChargeUsageLinksEachUsageRowToItsLedgerRow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close usage rows: %v", err)
+		}
+	}()
 	var count int
 	for rows.Next() {
 		var id int64
